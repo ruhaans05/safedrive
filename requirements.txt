@@ -2,5 +2,6 @@ torch
 torchvision
 numpy
 opencv-python
-pyyaml
-jupyter
+psutil
+tensorboard
+carla @ file:///<absolute_path_to_carla_egg_file>
