@@ -1,9 +1,17 @@
-# collect_data.py
 import carla
 import numpy as np
 import cv2
 import os
 import time
+import argparse
+import json
+
+# --- CLI Arguments ---
+parser = argparse.ArgumentParser()
+parser.add_argument("--duration", type=int, default=30, help="Recording duration in seconds")
+parser.add_argument("--fps", type=int, default=20, help="Frames per second")
+parser.add_argument("--name", type=str, default="drive", help="Name of data folder prefix")
+args = parser.parse_args()
 
 # --- Setup ---
 client = carla.Client('localhost', 2000)
@@ -12,125 +20,92 @@ world = client.get_world()
 
 bp_lib = world.get_blueprint_library()
 vehicle_bp = bp_lib.find('vehicle.tesla.model3')
-spawn = world.get_map().get_spawn_points()[0]
-vehicle = world.spawn_actor(vehicle_bp, spawn)
+spawn_point = world.get_map().get_spawn_points()[0]
+vehicle = world.spawn_actor(vehicle_bp, spawn_point)
 
-# --- Camera Blueprint (RGB) ---
+# --- Sensor Blueprints ---
 cam_bp = bp_lib.find('sensor.camera.rgb')
-cam_bp.set_attribute('image_size_x', '224')
-cam_bp.set_attribute('image_size_y', '224')
-cam_bp.set_attribute('fov', '110')
+cam_bp.set_attribute('image_size_x', '224'); cam_bp.set_attribute('image_size_y', '224'); cam_bp.set_attribute('fov', '110')
 
-# --- Camera Blueprint (Depth) ---
-depth_bp = bp_lib.find('sensor.camera.depth')
-depth_bp.set_attribute('image_size_x', '224')
-depth_bp.set_attribute('image_size_y', '224')
-depth_bp.set_attribute('fov', '110')
+lidar_bp = bp_lib.find('sensor.lidar.ray_cast') # <<< NEW >>>
+lidar_bp.set_attribute('range', '50')
+lidar_bp.set_attribute('points_per_second', '100000')
 
-# --- Camera Transforms ---
-def at_front():
-    return carla.Transform(carla.Location(x=1.5, z=1.8))
+# --- Sensor Transforms ---
+front_cam_transform = carla.Transform(carla.Location(x=1.5, z=1.8))
+lidar_transform = carla.Transform(carla.Location(z=1.9)) # <<< NEW >>>
 
-def at_left():
-    return carla.Transform(carla.Location(x=0, y=-0.5, z=1.8), carla.Rotation(yaw=-60))
-
-def at_right():
-    return carla.Transform(carla.Location(x=0, y=0.5, z=1.8), carla.Rotation(yaw=60))
-
-def at_rear():
-    return carla.Transform(carla.Location(x=-1.5, z=1.8), carla.Rotation(yaw=180))
-
-# --- Spawn Cameras ---
-front_cam = world.spawn_actor(cam_bp, at_front(), attach_to=vehicle)
-left_cam  = world.spawn_actor(cam_bp, at_left(),  attach_to=vehicle)
-right_cam = world.spawn_actor(cam_bp, at_right(), attach_to=vehicle)
-rear_cam  = world.spawn_actor(cam_bp, at_rear(),  attach_to=vehicle)
-depth_cam = world.spawn_actor(depth_bp, at_front(), attach_to=vehicle)  # Same location as front cam
+# --- Spawn Sensors ---
+front_cam = world.spawn_actor(cam_bp, front_cam_transform, attach_to=vehicle)
+lidar_sensor = world.spawn_actor(lidar_bp, lidar_transform, attach_to=vehicle) # <<< NEW >>>
+sensors = [front_cam, lidar_sensor]
 
 # --- Create Folders ---
-data_root = f"data_{int(time.time())}"
+timestamp = int(time.time())
+data_root = f"{args.name}_{timestamp}"
 os.makedirs(data_root, exist_ok=True)
 os.makedirs(f"{data_root}/front", exist_ok=True)
-os.makedirs(f"{data_root}/left", exist_ok=True)
-os.makedirs(f"{data_root}/right", exist_ok=True)
-os.makedirs(f"{data_root}/rear", exist_ok=True)
-os.makedirs(f"{data_root}/depth", exist_ok=True)
-os.makedirs(f"{data_root}/controls", exist_ok=True)
+os.makedirs(f"{data_root}/lidar", exist_ok=True) # <<< NEW >>>
 
-# --- Frame Counter ---
+# --- Frame & Control Logging ---
 frame_id = 0
+controls_log = []
 
-# --- Save Functions ---
-def save_front(image):
-    global frame_id
+def save_rgb(image):
     arr = np.frombuffer(image.raw_data, dtype=np.uint8).reshape((224, 224, 4))[:, :, :3]
     cv2.imwrite(f"{data_root}/front/{frame_id:06d}.png", cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
 
-def save_left(image):
-    global frame_id
-    arr = np.frombuffer(image.raw_data, dtype=np.uint8).reshape((224, 224, 4))[:, :, :3]
-    cv2.imwrite(f"{data_root}/left/{frame_id:06d}.png", cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
+def save_lidar(point_cloud): # <<< NEW >>>
+    """Processes LiDAR data into a 2D Bird's-Eye View image."""
+    points = np.frombuffer(point_cloud.raw_data, dtype=np.dtype('f4'))
+    points = np.reshape(points, (int(points.shape[0] / 4), 4))
+    
+    # Filter points to a 50x50m area in front of the car
+    lidar_range = 50.0
+    points = points[np.abs(points[:, 0]) < lidar_range]
+    points = points[np.abs(points[:, 1]) < lidar_range]
 
-def save_right(image):
-    global frame_id
-    arr = np.frombuffer(image.raw_data, dtype=np.uint8).reshape((224, 224, 4))[:, :, :3]
-    cv2.imwrite(f"{data_root}/right/{frame_id:06d}.png", cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
-
-def save_rear(image):
-    global frame_id
-    arr = np.frombuffer(image.raw_data, dtype=np.uint8).reshape((224, 224, 4))[:, :, :3]
-    cv2.imwrite(f"{data_root}/rear/{frame_id:06d}.png", cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
-
-def save_depth(image):
-    global frame_id
-    # CARLA encodes depth as a pseudo-color image
-    # Extract R, G, B channels
-    array = np.frombuffer(image.raw_data, dtype=np.uint8).reshape((224, 224, 4))[:, :, :3]
-    r = array[:, :, 0].astype(np.float32)
-    g = array[:, :, 1].astype(np.float32)
-    b = array[:, :, 2].astype(np.float32)
-    # Convert to depth in meters
-    normalized = (r + g * 256 + b * 256 * 256) / (256**3 - 1)
-    depth_meters = 1000 * normalized  # 0-1000m
-    # Save as PNG (normalized to 0-255 for visualization)
-    depth_vis = (depth_meters / 1000 * 255).astype(np.uint8)  # Normalize to 0-255
-    cv2.imwrite(f"{data_root}/depth/{frame_id:06d}.png", depth_vis)
+    # Convert to a 2D grid
+    bev_image = np.zeros((224, 224), dtype=np.uint8)
+    for p in points:
+        x, y = p[0], p[1]
+        # Convert coordinates to pixel locations
+        px = int(112 + x)
+        py = int(112 - y)
+        if 0 <= px < 224 and 0 <= py < 224:
+            bev_image[py, px] = 255 # Mark point as white
+            
+    cv2.imwrite(f"{data_root}/lidar/{frame_id:06d}.png", bev_image)
 
 def save_controls():
-    global frame_id
     control = vehicle.get_control()
-    np.save(f"{data_root}/controls/{frame_id:06d}.npy", {
-        'steer': float(control.steer),
-        'throttle': float(control.throttle),
-        'brake': float(control.brake),
-        'reverse': bool(control.reverse),
-        'hand_brake': bool(control.hand_brake)
+    velocity = vehicle.get_velocity()
+    speed_kmh = 3.6 * np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+    controls_log.append({
+        'frame': frame_id, 'steer': float(control.steer), 'throttle': float(control.throttle),
+        'brake': float(control.brake), 'speed_kmh': float(speed_kmh)
     })
 
 # --- Attach Listeners ---
-front_cam.listen(save_front)
-left_cam.listen(save_left)
-right_cam.listen(save_right)
-rear_cam.listen(save_rear)
-depth_cam.listen(save_depth)
+front_cam.listen(save_rgb)
+lidar_sensor.listen(save_lidar) # <<< NEW >>>
 
 # --- Start Recording ---
-print("🚗 Recording 360° driving data with depth... Drive manually for 30 seconds.")
+max_frames = args.duration * args.fps
+print(f"📹 Recording for {args.duration}s at {args.fps} FPS → {max_frames} frames.")
+print(f"💾 Saving data to: {data_root}")
+
 try:
-    while frame_id < 600:  # Record for ~30 seconds at ~20 FPS
-        # Save controls on every frame
-        if frame_id < 600:  # Only save if we're still recording
-            save_controls()
-        time.sleep(0.05)  # ~20 FPS
+    while frame_id < max_frames:
+        save_controls()
+        time.sleep(1 / args.fps)
         frame_id += 1
 except KeyboardInterrupt:
-    print("\n🛑 Recording interrupted by user.")
-
+    print("\n🛑 Recording interrupted manually.")
 finally:
-    print(f"✅ Recorded {frame_id} frames to {data_root}")
-    front_cam.stop()
-    left_cam.stop()
-    right_cam.stop()
-    rear_cam.stop()
-    depth_cam.stop()
-    vehicle.destroy()
+    for s in sensors:
+        if s.is_listening: s.stop()
+    with open(f"{data_root}/controls.json", "w") as f:
+        json.dump(controls_log, f, indent=2)
+    if vehicle.is_alive: vehicle.destroy()
+    print(f"\n✅ Done. {frame_id} frames saved in {data_root}")
